@@ -1,0 +1,9 @@
+__pycache__
+*.pyc
+.venv
+settings/production.py
+settings/development.py
+migrations
+*.bak
+*.sqlite3
+*.sqlite3.*
