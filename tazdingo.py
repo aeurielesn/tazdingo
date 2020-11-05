@@ -7,7 +7,7 @@ import sqlite3
 from asgiref.sync import sync_to_async
 from datetime import timedelta
 from django.utils import timezone
-from utils import get_human_time, parse_time
+from utils import get_human_time, get_member_name, is_tuple, parse_time
 
 # Django
 from conf import settings
@@ -20,7 +20,11 @@ SHIELD_EMOJI = '\N{SHIELD}'
 ALERTS_DELAY = 60
 TIMEDELTA_0 = timedelta(hours=0)
 TIMEDELTA_1 = timedelta(hours=1)
-TIME_RE = re.compile(r"\s*(?:(?P<days>\d+)\s*[dD])?\s*(?:(?P<hours>\d+)\s*[hH])?\s*(?:(?P<minutes>\d+)\s*[mM])?\s*(?:(?P<seconds>\d+)\s*[sS])?\s*")
+TIMEDELTA_4 = timedelta(hours=4)
+TIMEDELTA_8 = timedelta(hours=8)
+TIMEDELTA_12 = timedelta(hours=12)
+TIMEDELTA_24 = timedelta(hours=24)
+DEFAULT_SHIELDS = set([4, 8, 12, 24])
 
 
 class TazdingoPoach(object):
@@ -28,6 +32,7 @@ class TazdingoPoach(object):
         super(TazdingoPoach, self).__init__()
         self.shields = {}
         self.reins = {}
+        self.preys = {}
 
     def load_from_db(self):
         for _shield in models.Shield.objects.all():
@@ -35,6 +40,9 @@ class TazdingoPoach(object):
 
         for _rein in models.Reinforcement.objects.all():
             self.reins[_rein.user_id] = _rein
+
+        for _prey in models.Prey.objects.all():
+            self.preys[_prey.prey_name] = _prey
 
 
 class TazdingoCommands(object):
@@ -82,11 +90,41 @@ class TazdingoCommands(object):
             await self._on_recall(message)
         elif cmd == '$notify':
             await self._on_notify(message)
-        elif cmd == '$purge':
+        elif cmd == '$prune':
             if self._is_owner(message.author):
-                await self._on_purge(message)
+                await self._on_prune(message)
             else:
                 await self._error(message)    
+        elif cmd == '$track':
+            if len(args) == 1:
+                _prey_name = get_member_name(args[0], message.mentions)
+                await self._on_track(message, prey_name=_prey_name)
+            elif len(args):
+                _prey_name = get_member_name(args[0], message.mentions)
+
+                if is_tuple(args[1]):
+                    _coords = args[1]
+                    _shields = args[2:]
+                else:
+                    _coords = None 
+                    _shields = args[1:]
+
+                try:
+                    _shields = set(map(int, _shields))
+                except ValueError:
+                    await self._error(message)    
+                else:
+                    await self._on_track(message, prey_name=_prey_name, coords=_coords, shields=_shields)
+            else:
+                await self._error(message)    
+        elif cmd == '$lose':
+            if len(args) == 1:
+                _prey_name = get_member_name(args[0], message.mentions)
+                await self._on_lose(message, prey_name=_prey_name)
+            else:
+                await self._error(message)
+        elif cmd == '$tracks':
+            await self._on_tracks(message)
         elif cmd.startswith('$'):
             await self._error(message)
 
@@ -106,7 +144,12 @@ Reinforcement commands:
   $recall  recall a reinforcement
 
 Moderator commands:
-  $purge  remove expired shields```"""
+  $prune  remove expired shields
+
+Track commands:
+  $tracks                                shows all tracks
+  $track <who> [<x>,<y>] [<shields>...]  tracks a given set of shields
+  $lose <who>                            stop tracking```"""
         await message.channel.send(available_commands)
 
     async def _ack(self, message, text=""):
@@ -166,8 +209,8 @@ Moderator commands:
         _expires = _now + timedelta(seconds=seconds)
         _elapsed = _expires - _now
         _user_id = message.author.id
-        _expired_notification = False  # _expires < _now
-        _expiring_notification = False  # _elapsed < timedelta(hours=1)
+        _expired_notification = _expires < _now
+        _expiring_notification = _elapsed < timedelta(hours=1)
 
         _shield = models.Shield(
           name=message.author.name,
@@ -246,7 +289,7 @@ Moderator commands:
         else:
             await self._error(message)
 
-    async def _on_purge(self, message):
+    async def _on_prune(self, message):
         if self.poach.shields:
             _now = timezone.now()
             _expired_shields = [_user_id for _user_id, _shield in self.poach.shields.items() if _shield.expires < _now]
@@ -256,6 +299,83 @@ Moderator commands:
                 await self._ack(message)
             else:
                 await self._error(message)
+        else:
+            await self._error(message)
+
+    async def _lose(self, prey_name):
+        _prey = self.poach.preys.pop(prey_name, None)
+        if _prey:
+            await sync_to_async(_prey.delete, thread_sensitive=True)()
+
+    async def _on_track(self, message, prey_name, coords=None, shields=DEFAULT_SHIELDS):
+        _four_notification = 4 not in shields
+        _eight_notification = 8 not in shields
+        _twelve_notification = 12 not in shields
+        _twenty_four_notification = 24 not in shields
+
+        if _four_notification and _eight_notification and _twelve_notification and _twenty_four_notification:
+            await self._error(message)
+        else:
+            _now = timezone.now()
+            _user_id = message.author.id
+
+            _prey = models.Prey(
+                user_id=_user_id,
+                prey_name=prey_name,
+                entered=_now,
+                four_notification=_four_notification,
+                eight_notification=_eight_notification,
+                twelve_notification=_twelve_notification,
+                twenty_four_notification=_twenty_four_notification,
+            )
+
+            if coords is not None:
+                _prey.coords = coords
+
+            await self._lose(prey_name)
+            await sync_to_async(_prey.save, thread_sensitive=True)()
+            self.poach.preys[_prey.prey_name] = _prey
+            await self._ack(message)
+
+    async def _on_lose(self, message, prey_name):
+        if prey_name in self.poach.preys:
+            await self._lose(prey_name)
+            await self._ack(message)
+        else:
+            await self._error(message)
+
+    async def _on_tracks(self, message):
+        if self.poach.preys:
+            _now = timezone.now()
+            _expirations = []
+            for _prey in self.poach.preys.values():
+                if not _prey.four_notification and _prey.entered + TIMEDELTA_4 >= _now:
+                    _expires = _prey.entered + TIMEDELTA_4
+                elif not _prey.eight_notification and _prey.entered + TIMEDELTA_8 >= _now:
+                    _expires = _prey.entered + TIMEDELTA_8
+                elif not _prey.twelve_notification and _prey.entered + TIMEDELTA_12 >= _now:
+                    _expires = _prey.entered + TIMEDELTA_12
+                elif not _prey.twenty_four_notification and _prey.entered + TIMEDELTA_24 >= _now:
+                    _expires = _prey.entered + TIMEDELTA_24
+                else:
+                    continue
+
+                # print(_prey, _prey.entered, _expires, _prey.four_notification, _prey.eight_notification, _prey.twelve_notification, _prey.twenty_four_notification)
+                _remaining = max(_expires - _now, TIMEDELTA_0)
+                _expirations.append((_remaining, _prey))
+
+            _formatted_message = io.StringIO()
+            _formatted_message.write(f"Tracks:```")
+            for _idx, (_remaining, _prey) in enumerate(sorted(_expirations, key=lambda _p: _p[0])):
+                if _idx:
+                    _formatted_message.write(f"\n")
+
+                _human_time = get_human_time(_remaining)
+                _formatted_message.write(f"{_human_time} {_prey.prey_name}")
+
+            _formatted_message.write(f"```")
+            await message.channel.send(_formatted_message.getvalue())
+            await self._ack(message)
         else:
             await self._error(message)
 
@@ -309,6 +429,48 @@ class TazdingoClient(discord.Client):
             if _expiring_mentions:
                 _mentions = " ".join(_expiring_mentions)
                 await _channel.send(f"{_mentions} Hey! Your shield has almost expired!")
+
+            _prey_mentions = []
+            _expired_preys = []
+            for _prey in self.poach.preys.values():
+                _save = False
+                _elapsed = _now - _prey.entered
+                # print(_prey.prey_name, _elapsed, _prey.four_notification, _prey.eight_notification, _prey.twelve_notification, _prey.twenty_four_notification)
+                if not _prey.twenty_four_notification and _elapsed >= TIMEDELTA_24:
+                    _prey.four_notification = True
+                    _prey.eight_notification = True
+                    _prey.twelve_notification = True
+                    _prey.twenty_four_notification = True
+                    _what = "24"
+                    _save = True
+                elif not _prey.twelve_notification and _elapsed >= TIMEDELTA_12:
+                    _prey.four_notification = True
+                    _prey.eight_notification = True
+                    _prey.twelve_notification = True
+                    _what = "12"
+                    _save = True
+                elif not _prey.eight_notification and _elapsed >= TIMEDELTA_8:
+                    _prey.four_notification = True
+                    _prey.eight_notification = True
+                    _what = "8"
+                    _save = True
+                elif not _prey.four_notification and _elapsed >= TIMEDELTA_4:
+                    _prey.four_notification = True
+                    _what = "4"
+                    _save = True
+
+                if _save:
+                    if _prey.four_notification and _prey.eight_notification and _prey.twelve_notification and _prey.twenty_four_notification:
+                        _expired_preys.append(_prey)
+                    _prey_mentions.append((_prey, _what))
+                    await sync_to_async(_prey.save, thread_sensitive=True)()
+
+            for _prey, _what in _prey_mentions:
+                await _channel.send(f"<@!{_prey.user_id}> {_prey.prey_name}'s {_what} hour shield may have expired!")
+
+            for _prey in _expired_preys:
+                self.poach.preys.pop(_prey.prey_name, None)
+                await sync_to_async(_prey.delete, thread_sensitive=True)()
 
             await asyncio.sleep(ALERTS_DELAY)
 

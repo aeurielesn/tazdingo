@@ -4,6 +4,8 @@ import re
 
 COMPLEX_TIME_RE = re.compile(r"^(?:(?P<days>\d+)\s*(d|D|day|days))?\s*(?:(?P<hours>\d+)\s*(h|H|hour|hours))?\s*(?:(?P<minutes>\d+)\s*(m|M|min|mins|minute|minutes))?\s*(?:(?P<seconds>\d+)\s*(s|S|sec|secs|second|seconds))?\s*$")
 SIMPLE_TIME_RE = re.compile(r"^(?P<hours>\d+)$")
+TUPLE_RE = re.compile(r"^\d+,\d+\Z")
+MENTION_RE = re.compile(r"^<@!(\d)+>$")
 
 
 def get_human_time(elapsed_time):
@@ -53,3 +55,32 @@ def parse_time(input_time):
                 _matches = _m.groupdict(0)
                 _total_seconds = int(_matches.get('hours', 0)) * 3600
     return _total_seconds
+
+
+def is_tuple(string):
+    if TUPLE_RE.match(string):
+        return True
+    else:
+        return False
+
+
+def is_mention(string):
+    if MENTION_RE.match(string):
+        return True
+    else:
+        return False
+
+
+def get_member_name(mention_string, mentions):
+    _m = MENTION_RE.match(mention_string)
+    if not _m or not mentions:
+        return mention_string
+    elif len(mentions) == 1:
+        return mentions[0].name
+    else:
+        _user_id = _m.groups()[0]
+        for _mention in mentions:
+            if _mention.id == _user_id:
+                return _mention.id
+
+        return mention_string
